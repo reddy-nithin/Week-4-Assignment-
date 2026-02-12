@@ -1,11 +1,19 @@
+"""
+openfda_rag.py
+API-first helpers for building a lightweight RAG pipeline over openFDA drug labels.
+"""
+
 import json
 import os
 import re
 import html
 import time
 import pickle
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -18,10 +26,9 @@ try:
     from sentence_transformers import SentenceTransformer
 except Exception:
     SentenceTransformer = None
-try:
-    import ijson
-except Exception:
-    ijson = None
+
+OPENFDA_BASE_URL = "https://api.fda.gov/drug/label.json"
+OPENFDA_MAX_LIMIT = 1000
 
 
 @dataclass
@@ -93,22 +100,6 @@ def derive_doc_id(record: Dict[str, Any], idx: int) -> str:
     return f"record_{idx+1}"
 
 
-def load_records(json_path: str) -> List[Dict[str, Any]]:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("results", [])
-
-
-def iter_records(json_path: str, use_ijson: bool = False) -> Iterable[Dict[str, Any]]:
-    if use_ijson and ijson is not None:
-        with open(json_path, "rb") as f:
-            for item in ijson.items(f, "results.item"):
-                yield item
-    else:
-        for rec in load_records(json_path):
-            yield rec
-
-
 def fixed_size_chunk(text: str, words_per_chunk: int, overlap: int) -> List[str]:
     words = text.split()
     chunks: List[str] = []
@@ -124,6 +115,120 @@ def fixed_size_chunk(text: str, words_per_chunk: int, overlap: int) -> List[str]
 
 def tokenize(text: str) -> List[str]:
     return [t.lower() for t in re.findall(r"[a-zA-Z0-9]+", text)]
+
+
+def build_openfda_query(
+    prompt: str, fields: Optional[Iterable[str]] = None, max_terms: int = 8
+) -> str:
+    """
+    Convert a free-text prompt into an openFDA `search=field:term` query.
+    """
+    terms = [t for t in tokenize(prompt) if len(t) > 2][:max_terms]
+    if not terms:
+        return "_exists_:openfda"
+
+    if not fields:
+        return " ".join(terms)
+
+    field_list = list(fields)
+    groups = []
+    for term in terms:
+        group = " OR ".join(f"{field}:{term}" for field in field_list)
+        groups.append(f"({group})")
+    return " AND ".join(groups)
+
+
+def _openfda_request(
+    base_url: str, params: Dict[str, Any], timeout_s: int = 30
+) -> Dict[str, Any]:
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    url = f"{base_url}?{query}" if query else base_url
+    req = urllib.request.Request(url, headers={"User-Agent": "Week4-Assignment-RAG/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"openFDA HTTP error {e.code}: {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"openFDA request failed: {e.reason}") from e
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("openFDA response was not valid JSON") from e
+
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise RuntimeError(f"openFDA API error: {msg}")
+
+    return data
+
+
+def fetch_openfda_records(
+    search: str,
+    api_key: Optional[str] = None,
+    base_url: str = OPENFDA_BASE_URL,
+    limit: int = 100,
+    skip: int = 0,
+    sort: Optional[str] = None,
+    timeout_s: int = 30,
+) -> List[Dict[str, Any]]:
+    limit = min(max(1, limit), OPENFDA_MAX_LIMIT)
+    params = {"search": search, "limit": limit, "skip": skip, "sort": sort}
+    if api_key:
+        params["api_key"] = api_key
+    data = _openfda_request(base_url, params, timeout_s=timeout_s)
+    return data.get("results", []) if isinstance(data, dict) else []
+
+
+def iter_openfda_records(
+    search: str,
+    api_key: Optional[str] = None,
+    base_url: str = OPENFDA_BASE_URL,
+    limit: int = 100,
+    max_records: Optional[int] = None,
+    sort: Optional[str] = None,
+    pause_s: float = 0.0,
+    timeout_s: int = 30,
+) -> Iterable[Dict[str, Any]]:
+    limit = min(max(1, limit), OPENFDA_MAX_LIMIT)
+    fetched = 0
+    skip = 0
+
+    while True:
+        if max_records is not None and fetched >= max_records:
+            return
+
+        batch_limit = limit
+        if max_records is not None:
+            batch_limit = min(limit, max_records - fetched)
+            if batch_limit <= 0:
+                return
+
+        results = fetch_openfda_records(
+            search=search,
+            api_key=api_key,
+            base_url=base_url,
+            limit=batch_limit,
+            skip=skip,
+            sort=sort,
+            timeout_s=timeout_s,
+        )
+        if not results:
+            return
+
+        for rec in results:
+            yield rec
+            fetched += 1
+            if max_records is not None and fetched >= max_records:
+                return
+
+        skip += len(results)
+        if len(results) < batch_limit:
+            return
+        if pause_s:
+            time.sleep(pause_s)
 
 
 def _write_jsonl(path: str, items: List[Any]) -> None:
@@ -151,22 +256,12 @@ def _build_faiss_ip(vectors: np.ndarray):
     return index
 
 
-def _file_meta(path: str) -> Dict[str, Any]:
-    try:
-        stat = os.stat(path)
-        return {"path": path, "size": stat.st_size, "mtime": stat.st_mtime}
-    except OSError:
-        return {"path": path, "size": None, "mtime": None}
-
-
 def build_artifacts(
-    json_paths: List[str],
+    api_search: str,
     output_dir: str = "preprocessed",
     field_allowlist: Optional[List[str]] = None,
     field_blocklist: Optional[Iterable[str]] = None,
     include_table_fields: bool = False,
-    use_ijson: bool = False,
-    max_records: Optional[int] = None,
     min_chars: int = 40,
     words_per_chunk: int = 250,
     overlap: int = 40,
@@ -175,36 +270,40 @@ def build_artifacts(
     save: bool = True,
     save_vectorizer: bool = True,
     verbose: bool = True,
+    api_key: Optional[str] = None,
+    api_base_url: str = OPENFDA_BASE_URL,
+    api_limit: int = 200,
+    api_max_records: Optional[int] = None,
+    api_sort: Optional[str] = None,
+    api_pause_s: float = 0.0,
+    api_timeout_s: int = 30,
 ) -> Dict[str, Any]:
-    if isinstance(json_paths, str):
-        json_paths = [json_paths]
+    if not api_search:
+        raise ValueError("api_search is required for openFDA ingestion.")
 
     blocklist = set(field_blocklist or [])
-
-    if use_ijson and ijson is None:
-        if verbose:
-            print("⚠️ ijson not available; falling back to json.load")
-        use_ijson = False
-
     record_chunks: List[TextChunk] = []
     records_count = 0
-    stop = False
-    for jp in json_paths:
-        for rec in iter_records(jp, use_ijson=use_ijson):
-            if max_records and records_count >= max_records:
-                stop = True
-                break
-            doc_id = derive_doc_id(rec, records_count)
-            for field, text in pick_text_fields(
-                rec, field_allowlist, blocklist, include_table_fields
-            ).items():
-                if len(text) < min_chars:
-                    continue
-                chunk_id = f"{doc_id}::{field}"
-                record_chunks.append(TextChunk(chunk_id, doc_id, field, text))
-            records_count += 1
-        if stop:
-            break
+
+    for rec in iter_openfda_records(
+        search=api_search,
+        api_key=api_key,
+        base_url=api_base_url,
+        limit=api_limit,
+        max_records=api_max_records,
+        sort=api_sort,
+        pause_s=api_pause_s,
+        timeout_s=api_timeout_s,
+    ):
+        doc_id = derive_doc_id(rec, records_count)
+        for field, text in pick_text_fields(
+            rec, field_allowlist, blocklist, include_table_fields
+        ).items():
+            if len(text) < min_chars:
+                continue
+            chunk_id = f"{doc_id}::{field}"
+            record_chunks.append(TextChunk(chunk_id, doc_id, field, text))
+        records_count += 1
 
     sub_chunks: List[SubChunk] = []
     for rc in record_chunks:
@@ -250,20 +349,38 @@ def build_artifacts(
     faiss_A = _build_faiss_ip(vecs_A) if vecs_A is not None and len(texts_A) else None
     faiss_B = _build_faiss_ip(vecs_B) if vecs_B is not None and len(texts_B) else None
 
+    source_files = [
+        {
+            "path": api_base_url,
+            "search": api_search,
+            "limit": min(max(1, api_limit), OPENFDA_MAX_LIMIT),
+            "sort": api_sort,
+        }
+    ]
+
     manifest = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source_files": [_file_meta(p) for p in json_paths],
+        "source_type": "api",
+        "source_files": source_files,
         "config": {
             "field_allowlist": field_allowlist,
             "field_blocklist": sorted(blocklist),
             "include_table_fields": include_table_fields,
-            "use_ijson": use_ijson,
-            "max_records": max_records,
+            "max_records": api_max_records,
             "min_chars": min_chars,
             "words_per_chunk": words_per_chunk,
             "overlap": overlap,
             "use_st": use_st,
             "st_model": st_model,
+            "api": {
+                "base_url": api_base_url,
+                "search": api_search,
+                "limit": min(max(1, api_limit), OPENFDA_MAX_LIMIT),
+                "sort": api_sort,
+                "max_records": api_max_records,
+                "pause_s": api_pause_s,
+                "timeout_s": api_timeout_s,
+            },
         },
         "counts": {
             "records": records_count,
@@ -341,6 +458,14 @@ def build_artifacts(
         "vectorizer": vectorizer,
         "manifest": manifest,
     }
+
+
+# --- Usage (Week 4.ipynb) ---
+# 1) Set OPENFDA_* config values (search, limit, max records).
+# 2) Define OPENFDA_FIELD_ALLOWLIST / OPENFDA_FIELD_BLOCKLIST.
+# 3) Fetch records with iter_openfda_records or build_artifacts(...).
+# 4) Use the notebook's retrieve_from_api(...) to fetch -> chunk -> retrieve -> LLM.
+# 5) Run the demo loop to generate answers with citations.
 
 
 def load_artifacts(output_dir: str = "preprocessed", load_vectorizer: bool = True) -> Dict[str, Any]:
