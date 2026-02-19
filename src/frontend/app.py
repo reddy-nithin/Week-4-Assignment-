@@ -8,17 +8,16 @@ for drug-label evidence retrieval and grounded answers.
 import sys
 from pathlib import Path
 
-# ── Make src/ importable so we can reach rag_engine & openfda_rag ──
-_APP_DIR = Path(__file__).resolve().parent          # src/app/
-_SRC_DIR = _APP_DIR.parent                           # src/
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
+# ── Ensure project root is importable ─────────────────────────
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import streamlit as st
 from datetime import datetime
 import time
 
-from rag_engine import run_rag_query, read_logs
+from src.rag.engine import run_rag_query, read_logs
 
 # ─── Page config ──────────────────────────────────────────────
 st.set_page_config(

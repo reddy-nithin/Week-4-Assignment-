@@ -1,6 +1,6 @@
 """
-rag_engine.py  ·  TruPharma RAG Back-End
-=========================================
+engine.py  ·  TruPharma RAG Back-End
+=====================================
 Wraps openfda_rag helpers with:
   - Hybrid retrieval (dense + sparse + optional rerank)
   - LLM-grounded answer generation (Google Gemini or extractive fallback)
@@ -20,12 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-# ── Make sibling modules importable ──────────────────────────
-_SRC = Path(__file__).resolve().parent
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+# ── Ensure project root is importable ─────────────────────────
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-from openfda_rag import (
+from src.ingestion.openfda_client import (
     TextChunk,
     SubChunk,
     build_artifacts,
@@ -43,27 +43,25 @@ warnings.filterwarnings("ignore", message=".*unauthenticated.*")
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════
 
-FIELD_ALLOWLIST: List[str] = [
-    "active_ingredient",
-    "description",
-    "dosage_and_administration",
-    "drug_interactions",
-    "information_for_patients",
-    "when_using",
-    "overdosage",
-    "stop_use",
-    "user_safety_warnings",
-    "warnings",
-]
-FIELD_BLOCKLIST = {"spl_product_data_elements"}
+FIELD_ALLOWLIST = None  # None = include ALL fields (blocklist filters the noise)
+
+FIELD_BLOCKLIST = {
+    "spl_product_data_elements",
+    "spl_indexing_data_elements",
+    "effective_time",
+    "set_id",
+    "id",
+    "version",
+    "openfda",
+    "package_label_principal_display_panel",
+}
 
 API_BASE = "https://api.fda.gov/drug/label.json"
-DEFAULT_LIMIT = 20           # records per API page (keep small for cloud memory)
-DEFAULT_MAX_REC = 20         # total records to pull (enough for evidence, fits in 1GB)
-USE_SENTENCE_TRANSFORMERS = False   # False = TF-IDF (fast); True = dense (slow on CPU)
+DEFAULT_LIMIT = 20
+DEFAULT_MAX_REC = 20
+USE_SENTENCE_TRANSFORMERS = False
 
 # ── Logging paths ────────────────────────────────────────────
-_PROJECT_ROOT = _SRC.parent
 LOG_DIR = _PROJECT_ROOT / "logs"
 LOG_CSV = LOG_DIR / "product_metrics.csv"
 LOG_COLS = [
@@ -88,7 +86,7 @@ def _embed_query(query, embedder_type, embedder_model, vectorizer):
     """Embed a query using the same method that was used during indexing."""
     if embedder_type == "sentence_transformers":
         try:
-            from openfda_rag import _get_st_model
+            from src.ingestion.openfda_client import _get_st_model
         except ImportError:
             return None
         name = embedder_model or "sentence-transformers/all-MiniLM-L6-v2"
@@ -295,9 +293,6 @@ def run_rag_query(
     """
     End-to-end RAG pipeline:
       openFDA API fetch  ->  chunk  ->  index  ->  retrieve  ->  generate  ->  log
-
-    Returns dict with: answer, evidence, latency_ms, confidence, num_records,
-                       search_query, prompt, llm_used, method
     """
     t0 = time.time()
 
@@ -321,7 +316,6 @@ def run_rag_query(
             verbose=False,
         )
     except RuntimeError as exc:
-        # API error (404 = no matching labels, etc.) — return graceful refusal
         lat = round((time.time() - t0) * 1000, 1)
         if "404" in str(exc) or "Not Found" in str(exc):
             err_answer = "Not enough evidence in the retrieved context."
@@ -371,7 +365,6 @@ def run_rag_query(
         s = _sparse(query, bm25, corpus, pool)
         items = [it for _, it in _fuse(d, s, 0.5, pool)]
 
-    # -- Free heavy indexing objects to keep memory low on cloud --
     del arts, index, bm25, corpus, vec
     gc.collect()
 

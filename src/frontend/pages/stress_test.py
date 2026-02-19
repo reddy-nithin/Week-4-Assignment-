@@ -8,17 +8,16 @@ behaviour against the primary demo baseline.
 import sys
 from pathlib import Path
 
-# ── Make src/ importable ──
-_APP_DIR = Path(__file__).resolve().parent.parent   # src/app/
-_SRC_DIR = _APP_DIR.parent                           # src/
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
+# ── Ensure project root is importable ─────────────────────────
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import streamlit as st
 import time
 from datetime import datetime
 
-from rag_engine import run_rag_query, read_logs
+from src.rag.engine import run_rag_query, read_logs
 
 # ─── Page config ──────────────────────────────────────────────
 st.set_page_config(
@@ -105,7 +104,7 @@ span[class*="icon"] {
 # ══════════════════════════════════════════════════════════════
 st.sidebar.markdown("<div style='font-size:15px;font-weight:800;margin:10px 0 8px;'>Scenario Mode</div>", unsafe_allow_html=True)
 if st.sidebar.button("⬅ Return to Primary Demo", key="go_primary"):
-    st.switch_page("streamlit_app.py")
+    st.switch_page("app.py")
 
 st.sidebar.markdown(
     "<div class='scenario-card stress-active'>"
@@ -153,7 +152,6 @@ if "stress_condition" not in st.session_state:
 if run:
     stress_query = STRESS_QUERIES[stress_condition]
 
-    # Stress-specific RAG settings
     stress_config = {
         "Rare input":           {"api_limit": 20, "max_records": 20, "top_k": 3},
         "Large doc":            {"api_limit": 20, "max_records": 20, "top_k": 5},
