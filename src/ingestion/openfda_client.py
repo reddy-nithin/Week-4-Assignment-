@@ -7,6 +7,7 @@ import json
 import os
 import re
 import html
+import ssl
 import time
 import pickle
 import urllib.error
@@ -39,6 +40,18 @@ def _get_st_model(model_name: str):
 
 OPENFDA_BASE_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_MAX_LIMIT = 1000
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Build an SSL context using certifi certs (macOS Python needs this)."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_SSL_CTX = _ssl_context()
 
 
 @dataclass
@@ -153,9 +166,9 @@ def _openfda_request(
 ) -> Dict[str, Any]:
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     url = f"{base_url}?{query}" if query else base_url
-    req = urllib.request.Request(url, headers={"User-Agent": "Week4-Assignment-RAG/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "TruPharma/2.0"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s, context=_SSL_CTX) as resp:
             payload = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"openFDA HTTP error {e.code}: {e.reason}") from e
